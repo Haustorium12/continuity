@@ -189,7 +189,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
 def main():
     SIGNALS_DIR.mkdir(parents=True, exist_ok=True)
-    server = HTTPServer(("127.0.0.1", PROXY_PORT), ProxyHandler)
+    try:
+        server = HTTPServer(("127.0.0.1", PROXY_PORT), ProxyHandler)
+    except OSError:
+        # Port already in use -- another instance is running, exit quietly
+        log("Port {} already in use -- proxy already running.".format(PROXY_PORT))
+        return
     log("Proxy started on port {}.".format(PROXY_PORT))
     print("SSE proxy running on http://127.0.0.1:{}".format(PROXY_PORT))
     print("Add to Claude Code environment:")
