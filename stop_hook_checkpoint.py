@@ -6,11 +6,12 @@ Reads bell signal files written by sse_proxy.py.
 
 If any bells have fired since the last check:
   bell_70 -> write/update checkpoint, no warning
-  bell_85 -> write/update checkpoint + inject mild pressure warning
-  bell_95 -> write/update checkpoint + inject emergency warning
+  bell_85 -> write/update checkpoint + inject pressure warning + sticky note request
+  bell_95 -> write/update checkpoint + inject emergency warning + sticky note request
 
-The warning is injected as additionalContext so Claude sees it
-at the top of the next turn and can react (wrap up, save state, etc.).
+Also scans the last user message for session-close trigger words
+("save", "goodnight", etc.) and injects a sticky note write request
+so Claude overwrites project_current_state.md before the session ends.
 
 Bells are cleared after reading so each threshold fires once
 per crossing, not once per turn.
@@ -25,6 +26,21 @@ from pathlib import Path
 SIGNALS_DIR = Path.home() / ".claude" / "hooks" / "signals"
 CHECKPOINT = Path.home() / ".claude" / "compaction_checkpoint.md"
 LOG = Path.home() / ".claude" / "hooks" / "sse_proxy.log"
+SESSION_STATE = r"C:\Users\Sean\.claude\projects\C--dev\memory\project_current_state.md"
+
+CLOSE_TRIGGERS = [
+    "save", "goodnight", "good night", "wrap up", "wrapping up",
+    "closing", "close out", "done for today", "done for the day",
+    "end session", "signing off", "signing out", "bye", "goodbye",
+    "that's it for today", "thats it for today", "shutting down",
+]
+
+STICKY_NOTE_PROMPT = (
+    "[SESSION CLOSE] Overwrite {} now. "
+    "UDNL, <=60 lines. Sections: CONTEXT_SNAPSHOT, DONE_THIS_SESSION, "
+    "WHERE_WE_ARE, STILL_PENDING (only truly unfinished items), NEXT_MOVES, MOOD. "
+    "Be precise about what is done vs in-progress. This is the boot note."
+).format(SESSION_STATE)
 
 
 def log(msg):
@@ -169,6 +185,44 @@ def write_checkpoint(transcript_path, session_id, level, pct):
         log("Checkpoint write error: {}".format(e))
 
 
+def get_last_user_message(transcript_path):
+    """Return the last non-tool-result user message text from the transcript."""
+    last_user = None
+    try:
+        with open(transcript_path, encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    obj = json.loads(raw)
+                except Exception:
+                    continue
+                if obj.get("type") != "user":
+                    continue
+                content = obj.get("message", {}).get("content", [])
+                if isinstance(content, list) and any(
+                    isinstance(c, dict) and c.get("type") == "tool_result"
+                    for c in content
+                ):
+                    continue
+                text = extract_text(content)
+                if text:
+                    last_user = text
+    except Exception as e:
+        log("get_last_user_message error: {}".format(e))
+    return last_user
+
+
+def is_close_trigger(text):
+    """Return the matched trigger word if text contains a session-close signal."""
+    lower = text.lower()
+    for trigger in CLOSE_TRIGGERS:
+        if trigger in lower:
+            return trigger
+    return None
+
+
 def main():
     try:
         payload = json.loads(sys.stdin.read())
@@ -176,43 +230,66 @@ def main():
         payload = {}
 
     highest, signal_data = read_and_clear_signals()
-
-    if highest is None:
-        sys.exit(0)
-
     session_id = payload.get("session_id", "unknown")
     transcript_path = payload.get("transcript_path", "")
-    info = signal_data.get(highest, {})
-    pct = info.get("percentage", float(highest))
-    token_count = info.get("token_count", "?")
-    max_tokens = info.get("max_tokens", 200000)
 
-    log("Stop hook: bell_{} active. pct={:.1f}% session={}".format(highest, pct, session_id))
-
+    # Check for session-close trigger in last user message (always, regardless of bells)
+    trigger_word = None
     if transcript_path and os.path.exists(transcript_path):
-        write_checkpoint(transcript_path, session_id, highest, pct)
-    else:
-        log("No transcript path in Stop payload -- skipping checkpoint write.")
+        last_msg = get_last_user_message(transcript_path)
+        if last_msg:
+            trigger_word = is_close_trigger(last_msg)
+            if trigger_word:
+                log("Close trigger detected: '{}'".format(trigger_word))
 
-    if highest >= 85:
-        if highest >= 95:
-            msg = (
-                "[CONTEXT CRITICAL: {:.1f}% ({}/{} tokens used)] "
-                "Compaction is imminent. Finish the current task, "
-                "externalize critical state to memory files, "
-                "and prepare for context reset."
-            ).format(pct, token_count, max_tokens)
+    # If no bells and no trigger, nothing to do
+    if highest is None and not trigger_word:
+        sys.exit(0)
+
+    # Write checkpoint if bells fired
+    if highest is not None:
+        info = signal_data.get(highest, {})
+        pct = info.get("percentage", float(highest))
+        token_count = info.get("token_count", "?")
+        max_tokens = info.get("max_tokens", 200000)
+        log("Stop hook: bell_{} active. pct={:.1f}% session={}".format(highest, pct, session_id))
+        if transcript_path and os.path.exists(transcript_path):
+            write_checkpoint(transcript_path, session_id, highest, pct)
         else:
-            msg = (
-                "[CONTEXT PRESSURE: {:.1f}% ({}/{} tokens used)] "
-                "Context window is filling. Consider wrapping up long threads "
-                "and saving critical state before compaction fires."
-            ).format(pct, token_count, max_tokens)
+            log("No transcript path in Stop payload -- skipping checkpoint write.")
 
-        log("Injecting pressure warning (bell_{})".format(highest))
+    # Build additionalContext
+    context_parts = []
+
+    if highest is not None and highest >= 85:
+        if highest >= 95:
+            pressure = (
+                "[CONTEXT CRITICAL -- HARD STOP: {:.1f}% ({}/{} tokens used)] "
+                "Compaction fires next turn. You MUST do these three things RIGHT NOW "
+                "before responding to anything else: "
+                "(1) Finish or explicitly abandon the current task. "
+                "(2) Overwrite {} with current state (UDNL, <=60 lines). "
+                "(3) Acknowledge the state write in your response. "
+                "This is not optional. The context will be destroyed."
+            ).format(pct, token_count, max_tokens, SESSION_STATE)
+        else:
+            pressure = (
+                "[CONTEXT PRESSURE -- ACTION REQUIRED: {:.1f}% ({}/{} tokens used)] "
+                "Context window is at 85%%. You MUST overwrite {} now "
+                "with current session state (UDNL, <=60 lines) before continuing. "
+                "Do not defer. Write the sticky note this turn."
+            ).format(pct, token_count, max_tokens, SESSION_STATE)
+        context_parts.append(pressure)
+        log("Injecting hard pressure directive (bell_{})".format(highest))
+
+    if trigger_word:
+        context_parts.append(STICKY_NOTE_PROMPT)
+        log("Injecting sticky note prompt (trigger: '{}')".format(trigger_word))
+
+    if context_parts:
         print(json.dumps({
             "hookSpecificOutput": {
-                "additionalContext": msg
+                "additionalContext": "\n\n".join(context_parts)
             }
         }))
 
