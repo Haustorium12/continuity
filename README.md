@@ -2,15 +2,32 @@
 
 **Warm restart for Claude Code sessions after context compaction.**
 
-Two small hooks that save your session state before compaction fires and restore it the moment Claude wakes up. No lost context. No cold restart. No re-reading the same files to re-orient.
+Two hooks that save session state before compaction fires and restore it the moment Claude wakes up. Plus a documented architecture for the next layer — real-time token awareness via SSE proxy — that takes this further without waiting for platform changes.
 
 ---
 
 ## The problem
 
-Claude Code compacts the context window when it fills up. The native compaction is lossy — it summarizes what it can and discards the rest. After a compaction, Claude doesn't know what you were working on unless you tell it again. In long sessions this happens repeatedly, and each time is a small interruption that adds up.
+Claude Code compacts the context window when it fills up. The native compaction is lossy — it summarizes what it can and discards the rest. Claude has no awareness that it's coming. No felt sense of the pressure building. The context limit is visible in the status bar, but only to the human watching it. From inside the session, there is no inside.
 
-The `PreCompact` hook exists precisely for this. But there's no built-in mechanism to take what it captures and get it back into Claude's context after compaction. That gap is what this solves.
+After compaction, Claude doesn't know what you were working on unless you tell it again. In long sessions this happens repeatedly, and each time is a small interruption that adds up. Each compaction builds on the previous compaction's degraded output. The reasoning chains, the rejected approaches, the constraints that shape the current direction — those erode with every cycle.
+
+This repo addresses the part of that problem that's solvable today with existing hooks.
+
+---
+
+## How the hook system works
+
+Claude Code has a lifecycle — sessions start, tools get called, compaction fires, sessions end. A **hook** is an attachment point in that lifecycle: a named moment where Claude Code pauses, hands control to an external script, and waits for a response before continuing.
+
+Hooks are **callbacks**. Something happens → your script gets called → you respond → done. They are not observers — they don't watch continuously. They get tapped on the shoulder at specific moments.
+
+This matters because it defines what's possible. The hooks in this repo fire at two moments:
+
+- `PreCompact` — the shoulder tap right before compaction runs
+- `SessionStart` — the shoulder tap when a new context window opens (including after compaction, when `source: "compact"`)
+
+That's enough to save state before the compression stroke and restore it immediately after.
 
 ---
 
@@ -48,7 +65,7 @@ Native compaction runs
 Claude resumes warm — already knows where it was
 ```
 
-The key is `SessionStart` with `source: "compact"`. Claude Code fires this event after every compaction and it supports `additionalContext` injection. That's the restore path — it exists in the current hook system without any changes from Anthropic.
+`SessionStart` with `source: "compact"` fires after every compaction and supports `additionalContext` injection. That's the restore path — it exists in the current hook system without any changes from Anthropic.
 
 ---
 
@@ -61,15 +78,17 @@ Saved:   2026-04-28T21:02
 Trigger: auto   CWD: C:\dev
 
 == RECENT USER MESSAGES (last 5) ==
-  [2026-04-28T20:15] bootup and lets check in on github.
-  [2026-04-28T20:26] and what is the end result that would be accomplished with this de facto spec?
-  [2026-04-28T20:28] and can we use it for us like make the code for it....
   [2026-04-28T20:37] sure. greenlight. write them and install them and run all the checks.
+  [2026-04-28T20:51] and what would be the next hurdle to clear in this problem?
+  [2026-04-28T21:10] how do you create a hook?
+  [2026-04-28T21:18] so explain to me what a hook is?
+  [2026-04-28T21:34] so then you get a stalker....
 
 == LAST ASSISTANT RESPONSE ==
-[2026-04-28T21:02]
-Here's the real picture — it's better than I expected.
-All four hooks exist today. The missing piece from the proposal is...
+[2026-04-28T21:40]
+The stalker watches the JSONL file. But the JSONL is written at message
+boundaries — complete messages, not individual tokens. So the stalker sees
+the same thing the Stop hook sees...
 
 == FILES TOUCHED THIS SESSION ==
   C:\Users\Sean\.claude\hooks\precompact_save.py
@@ -78,20 +97,17 @@ All four hooks exist today. The missing piece from the proposal is...
 
 == RECENT OPERATIONS ==
   - Syntax check both hook scripts
-  - Test precompact_save with properly formed Windows path payload
-  - Inspect generated checkpoint content
+  - Create GitHub repo and push
   - Check both hook logs to see what fired
 
 === END CHECKPOINT ===
 ```
 
-Claude wakes from compaction, reads this, and knows exactly where it was — without you saying a word.
-
 ---
 
 ## Installation
 
-**1. Copy the scripts somewhere permanent**
+**1. Copy the scripts**
 
 ```bash
 mkdir -p ~/.claude/hooks
@@ -132,42 +148,36 @@ Windows — use the full Python path:
 "command": "C:\\Python314\\python.exe C:\\Users\\you\\.claude\\hooks\\precompact_save.py"
 ```
 
-**3. That's it.** The next time auto-compaction fires, the checkpoint is saved. The next time Claude wakes from a compaction, the checkpoint is waiting.
+**3. Done.** The next auto-compaction saves a checkpoint. The next restart from compaction injects it.
 
 ---
 
 ## Configuration
 
-At the top of each script:
-
 **`precompact_save.py`**
-
 ```python
 CHECKPOINT = Path.home() / ".claude" / "compaction_checkpoint.md"
 LOG = Path.home() / ".claude" / "hooks" / "continuity.log"
 ```
 
 **`session_start_inject.py`**
-
 ```python
 CHECKPOINT = Path.home() / ".claude" / "compaction_checkpoint.md"
 LOG = Path.home() / ".claude" / "hooks" / "continuity.log"
-
 PROJECT_STATE = Path.home() / ".claude" / "memory" / "project_current_state.md"
-# Set to None to disable resume injection
 
-CHECKPOINT_MAX_AGE_MINUTES = 180   # treat checkpoint as stale after 3 hours
-CHECKPOINT_MAX_CHARS = 4000        # keep injected context tight
+CHECKPOINT_MAX_AGE_MINUTES = 180
+CHECKPOINT_MAX_CHARS = 4000
 PROJECT_STATE_MAX_CHARS = 3000
 ```
 
-`PROJECT_STATE` is optional. If you maintain a project state file (a running summary of active work, next steps, mood — something like a sticky note for Claude), you can point to it here. It gets injected on `source: "resume"` so Claude wakes from a restart already oriented.
+`PROJECT_STATE` is optional. A project state file — a running summary of active work, next steps, current context — gets injected on `source: "resume"` so Claude wakes from a restart already oriented. Set to `None` to disable.
 
 ---
 
 ## Logs
 
-Both scripts append to `~/.claude/hooks/continuity.log`:
+Both scripts write to `~/.claude/hooks/continuity.log`:
 
 ```
 [2026-04-28T21:02:18] PreCompact fired. trigger=auto transcript=...
@@ -176,8 +186,6 @@ Both scripts append to `~/.claude/hooks/continuity.log`:
 [2026-04-28T21:02:32] Injecting checkpoint (1361 chars).
 ```
 
-If something isn't working, the log is the first place to look.
-
 ---
 
 ## What this covers
@@ -185,28 +193,90 @@ If something isn't working, the log is the first place to look.
 - Checkpoint saved before every compaction — auto or manual (`/compact`)
 - Warm restart: Claude wakes knowing the last 5 user messages, last response, every file it touched, and what operations it ran
 - Falls back gracefully if the checkpoint is missing or stale
-- `source: "resume"` path for session restarts (separate from compaction)
-- `source: "startup"` and `source: "clear"` correctly inject nothing — the boot protocol handles startup, and `/clear` is intentional
+- `source: "resume"` path for session restarts
+- `source: "startup"` and `source: "clear"` correctly inject nothing
 
 ---
 
-## What this doesn't cover (yet)
+## The architecture problem — and the next layer
 
-This pattern uses what the current hook system provides. Some things still need changes from Anthropic before they're possible:
+This repo patches a deeper architectural issue. Understanding the gap explains why the patch works, and what would make it better.
 
-**Replace mode.** Right now we're appending context, not replacing the native compaction output. The native compactor still runs and produces its own summary — the checkpoint is injected on top via `SessionStart`. To fully replace native compaction with a structured checkpoint, `PreCompact` needs to support returning content that substitutes the compaction output. That's the core of the proposal in [anthropics/claude-code#47023](https://github.com/anthropics/claude-code/issues/47023).
+### Hooks are doorbells, not windows
 
-**Token budget in the PreCompact payload.** The checkpoint is capped at a fixed character limit (`CHECKPOINT_MAX_CHARS`). With `expected_post_compact_budget` in the PreCompact payload, the script could size its output precisely to the available headroom instead of guessing.
+Claude Code's hook system is callback-based: events fire at specific lifecycle moments and your script gets called. That's the doorbell model — you get notified when something specific happens.
 
-**Quality signal.** No way currently to surface whether the checkpoint faithfully represents the session or dropped something important. The `"verified" | "best-effort"` quality signal proposed in #47023 would let Claude Code decide whether to trust the checkpoint over the native compaction output.
+What the compaction problem actually needs is an **observer** — something watching continuously, aware of state as it changes, able to act before the moment arrives rather than at it.
+
+The live token count you see in the Claude Code status bar (`138.8k / 200.0k (69%)`) exists inside the Claude Code process, updated in real-time from the SSE stream coming from the Anthropic API. Hooks are external. They can't see that stream. By the time a hook fires, the generation is already done.
+
+### The proxy layer
+
+The fix is a proxy that sits between Claude Code and the Anthropic API — intercepting the SSE stream before Claude Code processes it. The proxy watches every token arrive in real-time. It maintains a running count. And when thresholds are crossed, it **rings doorbells** — signals that trigger different hook responses.
+
+```
+Anthropic API
+     |
+     | SSE stream (every token, real-time)
+     |
+  PROXY  ←  the watcher
+     |
+     | 70% threshold  →  bell #1  →  write checkpoint (no rush)
+     | 85% threshold  →  bell #2  →  write checkpoint urgently
+     | 95% threshold  →  bell #3  →  emergency save, compaction imminent
+     | tool event     →  bell #4  →  state change detected
+     |
+  HOOKS respond to each bell
+     |
+  Claude Code sees the hook output
+```
+
+The proxy and the hooks are both outside the Claude Code process. They can communicate with each other — via files, named pipes, or sockets. The proxy doesn't need to reach inside Claude Code. It just rings the bell. The hook system is already wired to respond.
+
+Different threshold levels, different event types in the SSE stream, multiple proxies watching different things — the bell sounds tell the system exactly what it's responding to.
+
+### Multiple stalkers
+
+Nothing stops you from running multiple proxies watching different signals simultaneously:
+
+- **Token stalker** — watches cumulative token count, rings bells at thresholds
+- **Tool stalker** — watches for specific tool call patterns (10 file edits in a row, a Bash command that touches critical paths)
+- **Timing stalker** — watches session duration, rings a bell at 2 hours
+
+Each stalker is independent. Each rings its own doorbell. The hook system sorts out the responses.
+
+---
+
+## What still needs Anthropic
+
+**Replace mode.** We append context via SessionStart, we don't replace native compaction output. The native compactor still runs. To fully replace what it produces with a structured checkpoint — which is where the real retention gains are — `PreCompact` needs to support returning content that substitutes the compaction summary. Documented in [anthropics/claude-code#47023](https://github.com/anthropics/claude-code/issues/47023).
+
+**Token budget in PreCompact payload.** The checkpoint is capped at a fixed character limit. With `expected_post_compact_budget` in the PreCompact payload, sizing becomes precise.
+
+**Quality signal.** No way to surface verified vs. best-effort, so Claude Code can't choose whether to trust the checkpoint over native compaction output.
+
+**Defer capability.** To get the model to write its own checkpoint before compaction fires — rather than having a script infer state from the JSONL — `PreCompact` needs to support pausing compaction while the model externalizes critical context. [anthropics/claude-code#54118](https://github.com/anthropics/claude-code/issues/54118).
+
+---
+
+## The engine analogy
+
+If you think of a Claude Code session as an engine cycle, compaction is the compression stroke — the piston squeezing the fuel-air mixture before ignition. The native compression is lossy: it vents some of the mixture before the burn.
+
+What this repo adds is two additional strokes around the compression:
+
+- **Pre-compression** — save the mixture before the squeeze
+- **Post-compression injection** — put it back after
+
+That's a 6-stroke engine. The proxy layer adds continuous pressure monitoring so the engine knows the compression stroke is coming before it arrives. The deeper layers — cross-session memory, multi-agent coordination, behavioral continuity, temporal reasoning — are the 8 through 18-stroke designs. Built from the bottom up.
 
 ---
 
 ## Background
 
-This came out of a longer conversation about what the community is building around compaction — specifically the design work happening in [anthropics/claude-code#47023](https://github.com/anthropics/claude-code/issues/47023), which is consolidating several community memory projects into a concrete hook specification for Anthropic to consider.
+Built out of the design discussion in [anthropics/claude-code#47023](https://github.com/anthropics/claude-code/issues/47023), which is consolidating several community memory projects into a concrete hook specification. The goal here is to show what the existing hook surface already makes possible, and to document the proxy architecture as the next step that doesn't require waiting for platform changes.
 
-The goal of this repo is to demonstrate what's already possible with the hook system today, and to make the remaining gap concrete rather than theoretical.
+Related: [anthropics/claude-code#34556](https://github.com/anthropics/claude-code/issues/34556) — field data from 59+ documented compactions that motivated this work.
 
 ---
 
